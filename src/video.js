@@ -46,7 +46,7 @@ export class VideoGenerator {
           
         case 'click':
           await this.page.click(action.selector);
-          await this.page.waitForTimeout(500);
+          await new Promise(resolve => setTimeout(resolve, 500));
           break;
           
         case 'type':
@@ -56,14 +56,21 @@ export class VideoGenerator {
           break;
           
         case 'wait':
-          await this.page.waitForTimeout(action.duration);
+          await new Promise(resolve => setTimeout(resolve, action.duration));
           break;
           
         case 'screenshot':
           const screenshotPath = path.join(this.outputDir, `step-${step.index}-${screenshots.length}.png`);
-          await this.page.screenshot({ path: screenshotPath });
-          screenshots.push(screenshotPath);
-          console.log(`Captured screenshot: ${screenshotPath}`);
+          try {
+            await this.page.screenshot({ path: screenshotPath, fullPage: true });
+            // Verify file exists
+            await fs.access(screenshotPath);
+            screenshots.push(screenshotPath);
+            console.log(`Captured screenshot: ${screenshotPath}`);
+          } catch (error) {
+            console.error(`Failed to capture screenshot at ${screenshotPath}:`, error);
+            throw error;
+          }
           break;
           
         case 'action':
@@ -76,9 +83,16 @@ export class VideoGenerator {
     // If no explicit screenshots, take one at the end of the step
     if (screenshots.length === 0) {
       const screenshotPath = path.join(this.outputDir, `step-${step.index}.png`);
-      await this.page.screenshot({ path: screenshotPath });
-      screenshots.push(screenshotPath);
-      console.log(`Captured default screenshot: ${screenshotPath}`);
+      try {
+        await this.page.screenshot({ path: screenshotPath, fullPage: true });
+        // Verify file exists
+        await fs.access(screenshotPath);
+        screenshots.push(screenshotPath);
+        console.log(`Captured default screenshot: ${screenshotPath}`);
+      } catch (error) {
+        console.error(`Failed to capture default screenshot at ${screenshotPath}:`, error);
+        throw error;
+      }
     }
     
     return screenshots;
@@ -86,6 +100,24 @@ export class VideoGenerator {
 
   async generateStepVideo(screenshots, audioPath, stepIndex, duration) {
     const outputPath = path.join(this.videoDir, `step-${stepIndex}.mp4`);
+    
+    // Verify all screenshot files exist
+    for (const screenshot of screenshots) {
+      try {
+        await fs.access(screenshot);
+      } catch (error) {
+        throw new Error(`Screenshot file not found: ${screenshot}`);
+      }
+    }
+    
+    // Handle concat file for multiple images
+    let concatFile = null;
+    if (screenshots.length > 1) {
+      concatFile = path.join(this.videoDir, `concat-${stepIndex}.txt`);
+      const frameDuration = duration / screenshots.length / 1000;
+      const concatContent = screenshots.map(img => `file '${path.resolve(img)}'\nduration ${frameDuration}`).join('\n');
+      await fs.writeFile(concatFile, concatContent);
+    }
     
     return new Promise((resolve, reject) => {
       const command = ffmpeg();
@@ -95,30 +127,43 @@ export class VideoGenerator {
         // Single image, loop it for the duration
         command
           .input(screenshots[0])
-          .loop(duration / 1000)
-          .inputOptions(['-framerate 1']);
+          .inputOptions(['-loop 1', '-framerate 1']);
       } else {
-        // Multiple images, create slideshow
-        const frameDuration = duration / screenshots.length / 1000;
-        for (const screenshot of screenshots) {
-          command
-            .input(screenshot)
-            .inputOptions([`-t ${frameDuration}`]);
-        }
+        // Multiple images, create slideshow - use concat demuxer
+        command
+          .input(concatFile)
+          .inputOptions(['-f concat', '-safe 0']);
       }
       
       // Add audio if available
       if (audioPath) {
         command.input(audioPath);
+        // Set duration based on audio or specified duration
+        command.outputOptions([
+          '-c:v libx264',
+          '-c:a aac',
+          '-pix_fmt yuv420p',
+          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-shortest'
+        ]);
+      } else {
+        command.outputOptions([
+          '-c:v libx264',
+          '-pix_fmt yuv420p',
+          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-t', String(duration / 1000),
+          '-an'
+        ]);
       }
       
       command
-        .videoCodec('libx264')
-        .outputOptions([
-          '-pix_fmt yuv420p',
-          '-shortest'
-        ])
         .output(outputPath)
+        .on('start', (commandLine) => {
+          console.log(`FFmpeg command: ${commandLine}`);
+        })
+        .on('stderr', (stderrLine) => {
+          console.log(`FFmpeg stderr: ${stderrLine}`);
+        })
         .on('end', () => {
           console.log(`Generated video for step ${stepIndex}: ${outputPath}`);
           resolve(outputPath);
@@ -133,22 +178,27 @@ export class VideoGenerator {
 
   async combineVideos(videoPaths, outputPath) {
     return new Promise((resolve, reject) => {
-      const command = ffmpeg();
-      
       // Create concat file
       const concatFilePath = path.join(this.videoDir, 'concat.txt');
       const concatContent = videoPaths.map(p => `file '${path.resolve(p)}'`).join('\n');
       
       fs.writeFile(concatFilePath, concatContent).then(() => {
-        command
+        const command = ffmpeg()
           .input(concatFilePath)
           .inputOptions(['-f concat', '-safe 0'])
-          .videoCodec('libx264')
-          .audioCodec('aac')
-          .outputOptions(['-pix_fmt yuv420p'])
+          .outputOptions([
+            '-c:v libx264',
+            '-c:a aac',
+            '-pix_fmt yuv420p',
+            '-avoid_negative_ts make_zero'
+          ])
           .output(outputPath)
           .on('end', async () => {
-            await fs.unlink(concatFilePath);
+            try {
+              await fs.unlink(concatFilePath);
+            } catch (e) {
+              // Ignore cleanup errors
+            }
             console.log(`Generated final video: ${outputPath}`);
             resolve(outputPath);
           })
@@ -157,7 +207,7 @@ export class VideoGenerator {
             reject(err);
           })
           .run();
-      });
+      }).catch(reject);
     });
   }
 }
